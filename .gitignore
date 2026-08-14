@@ -1,0 +1,51 @@
+# ========== Keil MDK (STM32) 编译产物 ==========
+Objects/
+Listings/
+DebugConfig/
+*.uvguix*
+*.uvoptx
+*.uvogjx
+*.scvd
+*.build_log.htm
+*.axf
+*.elf
+*.lnp
+*.sct
+
+# ========== Keil RTE 备份文件 (*.base@* / *.update@*) ==========
+*.base@*
+*.update@*
+
+# ========== Qt / Qt Creator 本地文件 ==========
+*.pro.user
+*.qmake.stash
+*.ui.autosave
+build-*/
+Makefile
+Makefile.*
+
+# ========== 编译中间产物（通用） ==========
+*.o
+*.obj
+*.crf
+*.d
+*.bin
+*.hex
+*.map
+*.lst
+*.dep
+*.bak
+
+# ========== IDE / 操作系统 ==========
+.vscode/
+.vs/
+.idea/
+Thumbs.db
+Desktop.ini
+
+# ========== 其他 ==========
+# git 不识别 .ignore（由本文件代替）
+.ignore
+
+# 重复工程（保留 gateway-qt/，不再提交 gateway/）
+gateway/
