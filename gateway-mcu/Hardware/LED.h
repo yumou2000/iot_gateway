@@ -10,4 +10,7 @@ void LED1_Toggle(void);//翻转电平
 void LED2_ON(void);
 void LED2_OFF(void);
 void LED2_Toggle(void);//翻转电平
+
+
+void LED_PWM(void);
 #endif

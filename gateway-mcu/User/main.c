@@ -22,6 +22,10 @@
 #include "AHT30.h"
 #include "RTC_Controller.h"
 #include "ADC.h"
+#include "LED.h"
+#include "ZigBee.h"
+
+
 uint8_t connectstate = 0;
 uint8_t mqttState = 0;
 QueueHandle_t Cmd_Queue;
@@ -45,15 +49,7 @@ QueueHandle_t Result_Queue;
 
 TaskHandle_t MQTTReturnHandler;
 
-
-
-void LEDControlTask(void* param){
-	while(1){
-		//LED1_Toggle();
-		vTaskDelay(2000);
-	}
-}
-
+TaskHandle_t ZigBeeHandler;
 
 void connectWifiTask(void *param)
 {
@@ -167,10 +163,10 @@ void HardwareTask(void *param)
         if(xQueueReceive(Cmd_Queue, &cmd, portMAX_DELAY) == pdPASS)
         {
            if(cmd.led_on == 1){
-			   TIM_SetCompare3(TIM2,cmd.led_br*100);
+			   TIM_SetCompare1(TIM3,cmd.led_br*100);
 
 		   }else{
-				 TIM_SetCompare3(TIM2,0);
+				 TIM_SetCompare1(TIM3,0);
 		   }
 		   if(cmd.motor_on == 1){
 			   if(cmd.motor_dir == 1){
@@ -187,9 +183,9 @@ void HardwareTask(void *param)
 				TIM_SetCompare2(TIM2,0);
 		   }
 		   if(cmd.buzzer == 1){
-				GPIO_ResetBits(GPIOA,GPIO_Pin_3);
+				GPIO_ResetBits(GPIOA,GPIO_Pin_7);
 		   }else{
-				GPIO_SetBits(GPIOA,GPIO_Pin_3);
+				GPIO_SetBits(GPIOA,GPIO_Pin_7);
 		   }
 		   
 			result.result = 1;
@@ -231,6 +227,7 @@ void publishMqtt(char *topic, char *json)
         xSemaphoreGive(MQTT_Mutex);
     }
 }
+
 void gettime(char ts[24]){
 	/* 用RTC的真实时间生成时间戳（北京时间UTC+8） */
 		
@@ -333,15 +330,97 @@ void collectTask(void* param){
 	}
 }
 
+/* 解析一帧 ZigBee 收到的 JSON 指令，示例：
+ * {"type":"chsw","dev":"mcu01","ts":"2026-08-14 15:48:08","body":{"transport":"zigbee"}} */
+static void HandleZigbeeFrame(char *frame)
+{
+    cJSON *root = cJSON_Parse(frame);
+    if(root == NULL)
+    {
+        printf("Zigbee CMD parse fail\r\n");
+        return;
+    }
 
+    cJSON *type = cJSON_GetObjectItem(root, "type");
+    if(cJSON_IsString(type) && strcmp(type->valuestring, "chsw") == 0)
+    {
+        cJSON *body = cJSON_GetObjectItem(root, "body");
+        cJSON *transport = (body != NULL) ? cJSON_GetObjectItem(body, "transport") : NULL;
+        printf("Zigbee chsw, transport=%s\r\n",
+               cJSON_IsString(transport) ? transport->valuestring : "(none)");
+    }
+    else
+    {
+        printf("Zigbee CMD type=%s\r\n",
+               cJSON_IsString(type) ? type->valuestring : "?");
+    }
 
+    cJSON_Delete(root);
+}
 
+void ZigBeeTask(void* param){
+    /* 按 JSON 完整性拆帧：'{' 开始累积，'}' 配对闭合即一帧 */
+    char frame[256];
+    uint16_t len = 0;
+    int depth = 0;
+    uint8_t data;
+
+    while(1)
+    {
+        if(xQueueReceive(Zigbee_Queue, &data, portMAX_DELAY) == pdPASS)
+        {
+            char c = (char)data;
+
+            /* 帧外：等待 '{' 开始一帧 */
+            if(depth == 0)
+            {
+                if(c == '{')
+                {
+                    depth = 1;
+                    len = 0;
+                    frame[len++] = c;
+                }
+                continue;
+            }
+
+            /* 帧内：累积字节并跟踪 {} 深度，深度回到 0 即一帧完整 */
+            if(len < sizeof(frame) - 1)
+            {
+                frame[len++] = c;
+            }
+
+            if(c == '{')
+            {
+                depth++;
+            }
+            else if(c == '}')
+            {
+                depth--;
+                if(depth == 0)
+                {
+                    frame[len] = '\0';
+                    HandleZigbeeFrame(frame);
+                    len = 0;
+                }
+            }
+
+            /* 缓冲满仍未闭合：丢弃，重新等下一帧 */
+            if(len >= sizeof(frame) - 1 && depth > 0)
+            {
+                depth = 0;
+                len = 0;
+            }
+        }
+    }
+}
 int main()
 {
     //=====初始化=====
 	USART1_Init();
 	RTC_CTRL_Init();
+	Zigbee_Init();
 	BreathLEDInit();
+	LED_PWM();
 	dianjiInit();
 	BuzzerInit();
 	AHT30Init();
@@ -351,8 +430,10 @@ int main()
 	
 	Result_Queue = xQueueCreate(5, sizeof(Result_t));
 	MQTT_Mutex = xSemaphoreCreateMutex();
-	xTaskCreate(BreathLEDTask,"BreathLED",128,NULL,2,&BreathHandler);
 	
+	
+	xTaskCreate(BreathLEDTask,"BreathLED",128,NULL,2,&BreathHandler);
+	xTaskCreate(ZigBeeTask,"ZIGBEE",512,NULL,3,&ZigBeeHandler);
 	xTaskCreate(connectWifiTask,"WIFI",512,NULL,3,&connectWifiHandler);
 	
 	xTaskCreate(MQTTTask,"MQTT",512,NULL,4,&MQTTHandler);
