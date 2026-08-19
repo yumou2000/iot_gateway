@@ -111,8 +111,16 @@ void MQTTTask(void *param)
         else
         {
             Cmd_t cmd;
+            char msgCopy[BUFFER_SIZE];
 
-            cmd = ParseCmd(message);
+            /* 关中断保护下拷贝到本地再解析：publishMqtt/SendAT 会
+             * memset(message)，USART1 IDLE 中断也会改写 message，
+             * 直接在共享缓冲上解析会导致命令被并发清掉/覆盖而丢失 */
+            taskENTER_CRITICAL();
+            memcpy(msgCopy, message, BUFFER_SIZE);
+            taskEXIT_CRITICAL();
+
+            cmd = ParseCmd(msgCopy);
 
             if(cmd.valid != 0)
             {
@@ -120,6 +128,14 @@ void MQTTTask(void *param)
                 {
 					memset(message, 0, BUFFER_SIZE);
                 }
+            }
+            else if(strstr(msgCopy, "transport") != NULL)
+            {
+                /* 纯 transport 切换指令（type 非 cmd，如网关下发的
+                 * {"type":"chsw",...,"body":{"transport":"zigbee"}}）：
+                 * 通道模式已在 ParseCmd 中切换，这里清空 message，
+                 * 防止残留帧被反复解析，覆盖之后经其它链路切换的通道模式 */
+                memset(message, 0, BUFFER_SIZE);
             }
 
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -272,7 +288,16 @@ void MQTTReturnTask(void* param){
                     result.buzzer
             );
 
-            publishMqtt("\"dev/mcu01/report\"",mqtt_msg);
+            /* 回执通道与传感器上报一致：zigbee 模式经 USART2 串口直发（自动补 \n），
+             * MQTT 模式经 ESP8266 发布——zigbee 模式下上报完全脱离 MQTT */
+            if(transportMode == TRANSPORT_ZIGBEE)
+            {
+                Zigbee_SendLine(mqtt_msg);
+            }
+            else
+            {
+                publishMqtt("\"dev/mcu01/report\"",mqtt_msg);
+            }
         }
     }
 
@@ -289,7 +314,10 @@ void collectTask(void* param){
 	int light = 320;
 	int ir = 2500;
 	while(1){
-		if(mqttState != 1){
+		/* 上传通道由 transportMode 决定（下行 {"transport":"mqtt"|"zigbee"} 切换）：
+		 * MQTT 模式必须等 MQTT 连上才采集上报；
+		 * ZigBee 模式不依赖 MQTT，即使 MQTT 断线也能经 ZigBee 链路上传 */
+		if(transportMode == TRANSPORT_MQTT && mqttState != 1){
 			vTaskDelay(pdMS_TO_TICKS(1000));
 			continue;
 		}
@@ -305,7 +333,7 @@ void collectTask(void* param){
 		int32_t shidudec = (humi - shiduint)*10;
 		gettime(ts);
 
-		/* 先生成 JSON */
+		/* 先生成 JSON（两种通道共用同一份帧格式，云端两侧收到的数据一致） */
 		sprintf(json,
 				"{\"type\":\"sensor\","
 				"\"dev\":\"mcu01\","
@@ -322,40 +350,38 @@ void collectTask(void* param){
 				4095-DATA[0],
 				DATA[1]);
 
-		publishMqtt("\"dev/mcu01/report\"",json);
-		
-		
+		if(transportMode == TRANSPORT_ZIGBEE)
+		{
+			/* ZigBee 模式：直接经 USART2 发给 ZigBee 模块（自动补 \n 分帧），
+			 * 由网关串口侧按行分帧接收（DL-30 模块文档：每条消息必须以换行结尾） */
+			Zigbee_SendLine(json);
+		}
+		else
+		{
+			publishMqtt("\"dev/mcu01/report\"",json);
+		}
+
 		vTaskDelay(pdMS_TO_TICKS(1000));
 		
 	}
 }
 
-/* 解析一帧 ZigBee 收到的 JSON 指令，示例：
- * {"type":"chsw","dev":"mcu01","ts":"2026-08-14 15:48:08","body":{"transport":"zigbee"}} */
+/* 处理一帧 ZigBee 收到的 JSON 帧（网关经串口/DL-30 下发）：
+ * - 通道切换：ParseCmd 内解析顶层/body.transport，切换 transportMode
+ *   （含 {"type":"chsw",...,"body":{"transport":"zigbee"}}，ZigBee→MQTT 也经此）
+ * - 控制指令：type=cmd 的指令解析后送 Cmd_Queue，由 HardwareTask 执行
+ *   LED/电机/蜂鸣器控制（与 MQTT 下行共用同一处理链） */
 static void HandleZigbeeFrame(char *frame)
 {
-    cJSON *root = cJSON_Parse(frame);
-    if(root == NULL)
+    Cmd_t cmd = ParseCmd(frame);
+
+    if(cmd.valid != 0)
     {
-        printf("Zigbee CMD parse fail\r\n");
-        return;
+        xQueueSend(Cmd_Queue, &cmd, 0);
     }
 
-    cJSON *type = cJSON_GetObjectItem(root, "type");
-    if(cJSON_IsString(type) && strcmp(type->valuestring, "chsw") == 0)
-    {
-        cJSON *body = cJSON_GetObjectItem(root, "body");
-        cJSON *transport = (body != NULL) ? cJSON_GetObjectItem(body, "transport") : NULL;
-        printf("Zigbee chsw, transport=%s\r\n",
-               cJSON_IsString(transport) ? transport->valuestring : "(none)");
-    }
-    else
-    {
-        printf("Zigbee CMD type=%s\r\n",
-               cJSON_IsString(type) ? type->valuestring : "?");
-    }
-
-    cJSON_Delete(root);
+    /* 注：不再用 printf 打印帧内容——printf 经 fputc 重定向到 USART1，
+     * 会把调试文本直接打进 ESP8266 的 RX，干扰 AT/MQTT 状态机，导致 MQTT 收发异常 */
 }
 
 void ZigBeeTask(void* param){
@@ -383,7 +409,9 @@ void ZigBeeTask(void* param){
                 continue;
             }
 
-            /* 帧内：累积字节并跟踪 {} 深度，深度回到 0 即一帧完整 */
+            /* 帧内：累积字节并跟踪 {} 深度，深度回到 0 即一帧完整。
+             * 缓冲满（len 达到 sizeof(frame)-1）时整帧作废，不再触发处理，
+             * 避免发出缺末尾 '}' 的坏帧。 */
             if(len < sizeof(frame) - 1)
             {
                 frame[len++] = c;
@@ -398,9 +426,17 @@ void ZigBeeTask(void* param){
                 depth--;
                 if(depth == 0)
                 {
-                    frame[len] = '\0';
-                    HandleZigbeeFrame(frame);
-                    len = 0;
+                    if(len >= sizeof(frame) - 1)
+                    {
+                        /* 缓冲满丢尾：整帧作废 */
+                        len = 0;
+                    }
+                    else
+                    {
+                        frame[len] = '\0';
+                        HandleZigbeeFrame(frame);
+                        len = 0;
+                    }
                 }
             }
 
@@ -430,6 +466,15 @@ int main()
 	
 	Result_Queue = xQueueCreate(5, sizeof(Result_t));
 	MQTT_Mutex = xSemaphoreCreateMutex();
+
+    /* cJSON 的 malloc/free 切到 FreeRTOS heap_4（内部 vTaskSuspendAll 互斥），
+     * 避免 MQTTTask/ZigBeeTask 多任务并发调用 newlib malloc 损坏堆 */
+    {
+        cJSON_Hooks hooks;
+        hooks.malloc_fn = pvPortMalloc;
+        hooks.free_fn = vPortFree;
+        cJSON_InitHooks(&hooks);
+    }
 	
 	
 	xTaskCreate(BreathLEDTask,"BreathLED",128,NULL,2,&BreathHandler);

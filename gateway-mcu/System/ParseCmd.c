@@ -1,41 +1,74 @@
 #include "ParseCmd.h"
 #include <string.h>
 
-/* 递归查找任意层级的 "cmd" 字符串字段，
- * 支持 {"data":{"cmd":"LED_ON"}} 这类嵌套结构 */
- 
+volatile uint8_t transportMode = TRANSPORT_MQTT;
 
+/* 从消息中提取完整 JSON（第一个 { 到最后一个 }），返回长度；找不到或超长返回 0。
+ * 超长不截断：截断会丢掉末尾 '}'，产生坏帧。 */
+int ExtractJson(char *msg, char *out, int maxLen)
+{
+    char *start = strchr(msg, '{');
+    char *end   = strrchr(msg, '}');
+
+    if(start == NULL || end == NULL || end <= start)
+    {
+        return 0;
+    }
+
+    int len = (int)(end - start + 1);
+
+    if(len >= maxLen)
+    {
+        return 0;
+    }
+
+    strncpy(out, start, len);
+    out[len] = '\0';
+
+    return len;
+}
 
 /* 解析完整控制命令，返回结构体 */
 Cmd_t ParseCmd(char *msg)
 {
     Cmd_t cmd = {0};
 
-    char *start = strchr(msg, '{');
-    char *end   = strrchr(msg, '}');
+    char json[256];
 
-    if(start == NULL || end == NULL || end <= start)
+    if(ExtractJson(msg, json, sizeof(json)) == 0)
     {
         return cmd;
     }
-
-    char json[256];
-
-    int len = (int)(end - start + 1);
-
-    if(len >= sizeof(json))
-    {
-        len = sizeof(json) - 1;
-    }
-
-    strncpy(json, start, len);
-    json[len] = '\0';
 
     cJSON *root = cJSON_Parse(json);
 
     if(root == NULL)
     {
         return cmd;
+    }
+
+    /* 传输模式切换：不依赖 type，顶层 {"transport":"mqtt"|"zigbee"} 或
+     * body.transport 均可触发（兼容网关下发的 chsw 信封与裸切换指令）。
+     * 例如 {"type":"chsw","dev":"mcu01",...,"body":{"transport":"zigbee"}} */
+    cJSON *transport = cJSON_GetObjectItem(root, "transport");
+    cJSON *body = cJSON_GetObjectItem(root, "body");
+
+    if(!cJSON_IsString(transport) && cJSON_IsObject(body))
+    {
+        transport = cJSON_GetObjectItem(body, "transport");
+    }
+
+    if(cJSON_IsString(transport))
+    {
+        if(strcmp(transport->valuestring, "zigbee") == 0)
+        {
+            transportMode = TRANSPORT_ZIGBEE;
+            cmd.transport = 1;
+        }
+        else if(strcmp(transport->valuestring, "mqtt") == 0)
+        {
+            transportMode = TRANSPORT_MQTT;
+        }
     }
 
     /* 检查 type */
@@ -48,8 +81,8 @@ Cmd_t ParseCmd(char *msg)
         return cmd;
     }
 
-    /* 获取 body */
-    cJSON *body = cJSON_GetObjectItem(root, "body");
+    /* 获取 body（transport 解析时已取过，这里复用同一指针） */
+    body = cJSON_GetObjectItem(root, "body");
 
     if(!cJSON_IsObject(body))
     {

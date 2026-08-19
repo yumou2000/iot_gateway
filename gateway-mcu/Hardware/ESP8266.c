@@ -57,7 +57,7 @@ uint8_t CloseATEAndConnectWifi(void){
 	else{//如果WIFI之前没连接上，需要不断重连
 		while(1){
 			SendAT("AT+CWMODE=1\r\n","OK",500);
-			SendAT("AT+CWJAP=\"Mate\",\"12356789\"\r\n","OK",20000);
+			SendAT("AT+CWJAP=\"jang\",\"12345678\"\r\n","OK",20000);
 			
 			if(SendAT("AT+CWJAP?\r\n","+CWJAP:\"",500)){
 				return 1;
@@ -252,7 +252,7 @@ uint8_t connectMQTT(uint32_t timeout)
 			continue;
 		}
 		flag1 = 0;
-		if(flag2 && !SendAT("AT+MQTTCONN=0,\"8.149.138.159\",1883,0\r\n","+MQTTCONNECTED",5000))
+		if(flag2 && !SendAT("AT+MQTTCONN=0,\"192.168.137.198\",1883,0\r\n","+MQTTCONNECTED",5000))
 		{
 			time += 5;
 			vTaskDelay(5);

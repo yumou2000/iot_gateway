@@ -1,6 +1,8 @@
 #include "Zigbee.h"
+#include "semphr.h"
 
 QueueHandle_t Zigbee_Queue;
+SemaphoreHandle_t Zigbee_TX_Mutex;
 
 
 void Zigbee_Init(void)
@@ -96,8 +98,14 @@ void Zigbee_Init(void)
     NVIC_InitStructure.NVIC_IRQChannel =
         USART2_IRQn;
 
+    /* 抢占优先级必须 ≥ 11（数值，越低越优先）：FreeRTOSConfig.h 里
+     * configMAX_SYSCALL_INTERRUPT_PRIORITY=191(0xB0,高4位=11)，
+     * 只有优先级数值 ≥ 11 的中断才允许调用 FreeRTOS API（xQueueSendFromISR）。
+     * 原值 5 会在 FreeRTOS 临界区（BASEPRI=0xB0，只能屏蔽数值 ≥11 的中断）
+     * 执行期间触发，打断 xQueueSend 等队列操作的中间状态，破坏队列，
+     * 导致 ZigBeeTask 此后永远收不到下行数据（上行 TX 不受影响）。 */
     NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority =
-        5;
+        12;
 
     NVIC_InitStructure.NVIC_IRQChannelSubPriority =
         0;
@@ -117,6 +125,10 @@ void Zigbee_Init(void)
             128,
             sizeof(uint8_t)
         );
+
+    /* 发送互斥量：ZigBee 链路上行(collectTask)与下行处理可能并发
+     * 调用 Zigbee_SendString/SendLine，互斥防止 USART2 发送字符交错 */
+    Zigbee_TX_Mutex = xSemaphoreCreateMutex();
 
 
     /* =========================
@@ -169,8 +181,31 @@ void Zigbee_SendByte(uint8_t data)
 
 void Zigbee_SendString(char *str)
 {
-    while(*str)
+    /* 加锁发送，防止与其它任务并发时 USART2 字符交错 */
+    if(xSemaphoreTake(Zigbee_TX_Mutex, portMAX_DELAY) == pdTRUE)
     {
-        Zigbee_SendByte(*str++);
+        while(*str)
+        {
+            Zigbee_SendByte(*str++);
+        }
+
+        xSemaphoreGive(Zigbee_TX_Mutex);
+    }
+}
+
+/* 发送一整行（字符串 + 换行 \n）：网关按 '\n' 分帧（DL-30 模块文档
+ * “每条消息必须以换行结尾”），MCU 侧上报必须补换行，否则网关收不到完整帧 */
+void Zigbee_SendLine(char *str)
+{
+    if(xSemaphoreTake(Zigbee_TX_Mutex, portMAX_DELAY) == pdTRUE)
+    {
+        while(*str)
+        {
+            Zigbee_SendByte(*str++);
+        }
+
+        Zigbee_SendByte('\n');
+
+        xSemaphoreGive(Zigbee_TX_Mutex);
     }
 }
