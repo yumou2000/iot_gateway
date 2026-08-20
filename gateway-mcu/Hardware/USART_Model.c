@@ -77,8 +77,13 @@ void USART1_Init(void)
 	NVIC_InitTypeDef NVIC_InitStruct;
 	NVIC_InitStruct.NVIC_IRQChannel = USART1_IRQn;
 	NVIC_InitStruct.NVIC_IRQChannelCmd = ENABLE;
-	NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 1;
-	NVIC_InitStruct.NVIC_IRQChannelSubPriority = 1;
+	/* 抢占优先级必须 ≥ 11（数值，越低越优先）：FreeRTOSConfig.h 里
+	 * configMAX_SYSCALL_INTERRUPT_PRIORITY=191(0xB0,高4位=11)。原值 1 会
+	 * 抢占 PendSV/SysTick（优先级 15）且在临界区（全关中断）之外随时改写
+	 * 共享的 message 缓冲，与 SendAT/WaitAT/MQTTTask 的读写竞争。
+	 * 改 12 与 USART2（ZigBee）一致，并允许中断里调用 FromISR 系列 API。 */
+	NVIC_InitStruct.NVIC_IRQChannelPreemptionPriority = 12;
+	NVIC_InitStruct.NVIC_IRQChannelSubPriority = 0;
 	NVIC_Init(&NVIC_InitStruct);
 	
 	//6.使能

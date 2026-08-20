@@ -27,7 +27,7 @@
 
 
 uint8_t connectstate = 0;
-uint8_t mqttState = 0;
+volatile uint8_t mqttState = 0;
 QueueHandle_t Cmd_Queue;
 
 SemaphoreHandle_t MQTT_Mutex;
@@ -85,6 +85,7 @@ void connectWifiTask(void *param)
 void MQTTTask(void *param)
 {
     uint8_t flag = 0;
+    uint8_t connFail = 0;
 	
     while(1)
     {
@@ -102,9 +103,18 @@ void MQTTTask(void *param)
             if(flag)
             {
 				mqttState = 1;
+				connFail = 0;
             }
             else
             {
+				if(++connFail >= 3)
+				{
+					/* 连续多次连接失败：模块可能状态异常（MQTT 客户端卡死等），
+					 * 软复位恢复（内部会先解 PUBRAW 卡死态），复位后重新连 WiFi */
+					connFail = 0;
+					ESP_Restart();
+					ESP_EnsureWifi();
+				}
                 vTaskDelay(pdMS_TO_TICKS(3000));
             }
         }
@@ -119,6 +129,18 @@ void MQTTTask(void *param)
             taskENTER_CRITICAL();
             memcpy(msgCopy, message, BUFFER_SIZE);
             taskEXIT_CRITICAL();
+
+            /* 断线检测：publish 侧标记需要重连（mqttState==0），
+             * 或模块上报了 MQTT 断开事件（+MQTTDISCONNECTED） */
+            if(mqttState == 0 ||
+               strstr(msgCopy, "+MQTTDISCONNECTED") != NULL)
+            {
+                flag = 0;
+                mqttState = 0;
+                memset(message, 0, BUFFER_SIZE);
+                vTaskDelay(pdMS_TO_TICKS(1000));
+                continue;
+            }
 
             cmd = ParseCmd(msgCopy);
 
@@ -218,17 +240,26 @@ AHT data = {0};
 void publishMqtt(char *topic, char *json)
 {
     char pubRaw[128];
+    int len = (int)strlen(json);
 
     if(xSemaphoreTake(MQTT_Mutex, portMAX_DELAY) == pdTRUE)
     {
         sprintf(pubRaw,
                 "AT+MQTTPUBRAW=0,%s,%d,1,0\r\n",
                 topic,
-                (int)strlen(json));
+                len);
 
         if(!SendAT(pubRaw, ">", 5000))
         {
-            /* 失败也必须释放 Mutex */
+            /* 等不到 ">"：ESP8266 可能已进入“等待 payload”状态（返回的 ">"
+             * 被 USART1 异步帧覆盖/误匹配）。先试探是否在线：无响应则补发
+             * 填充字节使其退出等待态，否则 AT 状态机被永久卡死，后续所有
+             * AT 指令（含重连 WiFi）都会被当作 payload 吞掉 */
+            if(!SendAT("AT\r\n", "OK", 200))
+            {
+                ESP_FlushMqttPayload(len);
+            }
+            mqttState = 0;              /* 让 MQTTTask 重新走连接流程 */
             xSemaphoreGive(MQTT_Mutex);
             return;
         }
@@ -237,6 +268,8 @@ void publishMqtt(char *topic, char *json)
 
         if(!WaitAT("OK", 2000))
         {
+            /* 发送结果未知，MQTT 连接可能已被破坏：触发重连 */
+            mqttState = 0;
         }
 
         /* 正常发送完成，释放 Mutex */
@@ -294,10 +327,12 @@ void MQTTReturnTask(void* param){
             {
                 Zigbee_SendLine(mqtt_msg);
             }
-            else
+            else if(mqttState == 1)
             {
                 publishMqtt("\"dev/mcu01/report\"",mqtt_msg);
             }
+            /* MQTT 未连接时丢弃回执：避免 publishMqtt 与 MQTTTask 的
+             * connectMQTT AT 指令流并发交错，破坏 ESP8266 状态机 */
         }
     }
 
@@ -361,7 +396,7 @@ void collectTask(void* param){
 			publishMqtt("\"dev/mcu01/report\"",json);
 		}
 
-		vTaskDelay(pdMS_TO_TICKS(1000));
+		vTaskDelay(pdMS_TO_TICKS(3000));
 		
 	}
 }
@@ -453,6 +488,9 @@ int main()
 {
     //=====初始化=====
 	USART1_Init();
+	/* ESP8266 RST 接 PB14：上电主动硬件复位一次，避免复位 STM32 时
+	 * ESP8266 残留卡死状态（这是"复位后连不上 WiFi"的治本修复） */
+	ESP8266_RST_Init();
 	RTC_CTRL_Init();
 	Zigbee_Init();
 	BreathLEDInit();
